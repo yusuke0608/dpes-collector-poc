@@ -1,0 +1,68 @@
+# 外部死活監視（DPESのサーバー外からの生存確認）。
+#
+# 背景: DPESの見張り(cron)はすべてVercel/Railway上で動くため、基盤ごと落ちると警報も一緒に
+#   沈黙する。GitHub Actions は独立基盤なので、ここから dpes.jp / api.dpes.jp を定期チェックし、
+#   落ちていたらオーナーへメール(Resend)で即知らせる。
+# 誤報対策: 各チェックは30秒間隔で3回リトライし、3回とも失敗した時だけ「ダウン」と判定。
+# 注意: GitHub Actions の schedule は数分遅れることがある（死活監視の用途では許容）。
+name: Uptime Watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # 約10分毎（UTC・遅延あり得る）
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check endpoints (3 retries each)
+        id: check
+        run: |
+          set +e
+          check() { # $1=name $2=url $3=expected_code
+            for i in 1 2 3; do
+              code=$(curl -sS -m 20 -o /dev/null -w "%{http_code}" "$2" 2>/dev/null)
+              if [ "$code" = "$3" ]; then
+                echo "$1: OK ($code)"
+                return 0
+              fi
+              echo "$1: attempt $i got '$code' (expect $3)"
+              [ $i -lt 3 ] && sleep 30
+            done
+            echo "FAILED_$1=$code" >> "$GITHUB_OUTPUT"
+            return 1
+          }
+          fails=""
+          check "front" "https://dpes.jp/" 200 || fails="$fails フロント(dpes.jp)"
+          check "api" "https://api.dpes.jp/health" 200 || fails="$fails API(api.dpes.jp)"
+          if [ -n "$fails" ]; then
+            echo "fails=$fails" >> "$GITHUB_OUTPUT"
+            echo "down=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "down=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Alert owner via Resend
+        if: steps.check.outputs.down == 'true'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          FAILS: ${{ steps.check.outputs.fails }}
+        run: |
+          # 3回リトライ後も落ちていた時だけ届く。基盤ごとのダウンでも外部(GitHub)から検知できる。
+          jst=$(TZ=Asia/Tokyo date '+%m/%d %H:%M')
+          curl -sS -m 20 https://api.resend.com/emails \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -d "$(cat <<EOF
+          {
+            "from": "noreply@dpes.jp",
+            "to": ["info.globalink.co.ltd@gmail.com"],
+            "subject": "🚨 [DPES外部監視] サイトがダウンしています ($jst)",
+            "text": "外部監視(GitHub Actions)からの通知です。\n\n応答がありません:$FAILS\n（30秒間隔で3回試して全て失敗）\n\n・数分後にもう一度 https://dpes.jp を開いて確認してください\n・続く場合は Vercel / Railway の障害情報を確認: https://www.vercel-status.com / https://status.railway.com\n・この監視はDPESのサーバーとは独立して動いているため、本体が全停止しても届きます"
+          }
+          EOF
+          )" && echo "alert sent"
