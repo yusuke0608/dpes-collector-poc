@@ -5,6 +5,9 @@
 #   落ちていたらオーナーへメール(Resend)で即知らせる。
 # 誤報対策: 各チェックは30秒間隔で3回リトライし、3回とも失敗した時だけ「ダウン」と判定。
 # 注意: GitHub Actions の schedule は数分遅れることがある（死活監視の用途では許容）。
+# ハートビート: この監視自体が止まっていないかをクラウド側の点検で確認できるよう、サイトが正常だった時だけ
+#   1日1通（UTC日で判定・actions/cache に送信済みマーカーを保存）「稼働中」メールを送る。
+#   ダウン警報(🚨)と稼働中メールが同じ実行で両方飛ぶことはない。送信失敗でもジョブは失敗させない。
 name: Uptime Watch
 
 on:
@@ -66,3 +69,48 @@ jobs:
           }
           EOF
           )" && echo "alert sent"
+
+      # ---- 以下: 1日1通の「稼働中」ハートビート（サイト正常時のみ） ----
+      - name: Heartbeat date keys (UTC day / JST date)
+        id: date
+        if: steps.check.outputs.down == 'false'
+        run: |
+          echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "jst=$(TZ=Asia/Tokyo date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Heartbeat sent marker (once per UTC day)
+        id: heartbeat-cache
+        if: steps.check.outputs.down == 'false'
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: .heartbeat-sent
+          key: dpes-uptime-heartbeat-${{ steps.date.outputs.day }}
+
+      - name: Heartbeat mail via Resend (alive)
+        id: heartbeat
+        if: steps.check.outputs.down == 'false' && steps.heartbeat-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          JST_DATE: ${{ steps.date.outputs.jst }}
+        run: |
+          # その日(UTC)最初の正常確認でだけ届く。送れた時だけマーカーを作り、ジョブ終了時に cache へ保存される。
+          set +e
+          code=$(curl -sS -m 20 -o /tmp/heartbeat-resp.json -w "%{http_code}" https://api.resend.com/emails \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -d "$(cat <<EOF
+          {
+            "from": "noreply@dpes.jp",
+            "to": ["info.globalink.co.ltd@gmail.com"],
+            "subject": "[DPES外部監視] 稼働中 $JST_DATE",
+            "text": "外部監視（GitHub Actions Uptime Watch）は稼働中です。直近の確認: dpes.jp 200 / api.dpes.jp/health 200"
+          }
+          EOF
+          )")
+          case "$code" in
+            2*) touch .heartbeat-sent; echo "heartbeat sent ($JST_DATE)" ;;
+            *)  echo "heartbeat send failed (http $code)"; cat /tmp/heartbeat-resp.json 2>/dev/null; echo ;;
+          esac
+          exit 0
